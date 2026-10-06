@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.cache/
+archive/
+runs/
+!pdfs/
+pdfs/*
+!pdfs/.gitkeep
+CTMLs/
+evaluation/gold/
+evaluation/profiles/
+/pmatch-ctml-criterion-continuation.patch
+
+# The parent repository ignores requirements.in by name; this package needs it.
+!requirements.in

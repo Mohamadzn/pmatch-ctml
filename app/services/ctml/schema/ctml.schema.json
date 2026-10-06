@@ -1,0 +1,801 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:uhn:pmatch:ctml:ctims-catalog-2026-09-26",
+  "title": "CTMLDocument",
+  "$comment": "UHN CTML output schema aligned with the CTIMS form field catalog (ctims-form-field-catalog w description.xlsx) and the September gold files. Fields the catalog marks hidden, UI: No or Don't extract are not allowed, except the gold placeholder shells. Output-policy rules that JSON Schema cannot express (key order, empty drug_list shell, no status, arm_additional_criteria_not_captured always written) are checked by ctml_shape_check.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trial_id",
+    "long_title",
+    "short_title",
+    "protocol_no",
+    "phase",
+    "nct_purpose",
+    "sponsor_list",
+    "treatment_list"
+  ],
+  "properties": {
+    "trial_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Trial ID. Catalog: any string, normally the NCT number."
+    },
+    "long_title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Official title, usually from the cover page."
+    },
+    "short_title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Condensed official title."
+    },
+    "protocol_no": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Sponsor protocol number (labelled protocol number; the running footer value is a cross-check)."
+    },
+    "protocol_version_no": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Protocol version or amendment label."
+    },
+    "protocol_version_date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3})?Z)?$",
+      "description": "ISO date. Gold stores YYYY-MM-DDT04:00:00.000Z; catalog says format date (adjudication item)."
+    },
+    "phase": {
+      "type": "string",
+      "pattern": "^(I|II|III|IV)(/(I|II|III|IV))*$",
+      "description": "Roman numerals. The catalog field is multiselect; the JSON form for combined phases (I/II) is an adjudication item."
+    },
+    "nct_purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Why the trial is conducted: drug(s), population, objective."
+    },
+    "principal_investigator": {
+      "type": "string",
+      "description": "Site PI; not in the protocol. Output \"\"."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "",
+        " ",
+        "Recruiting",
+        "Active, not recruiting",
+        "Not yet recruiting",
+        "Closed",
+        "Completed"
+      ],
+      "description": "Catalog: Don't extract. Pipeline output omits it; allowed only so gold files validate."
+    },
+    "drug_list": {
+      "$ref": "#/$defs/CTMLDrugList"
+    },
+    "management_group_list": {
+      "$ref": "#/$defs/CTMLManagementGroupList"
+    },
+    "site_list": {
+      "$ref": "#/$defs/CTMLSiteList"
+    },
+    "sponsor_list": {
+      "$ref": "#/$defs/CTMLSponsorList"
+    },
+    "staff_list": {
+      "$ref": "#/$defs/CTMLStaffList"
+    },
+    "treatment_list": {
+      "$ref": "#/$defs/CTMLTreatmentList"
+    },
+    "additional_criteria_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Trial-wide requirements not captured in match trees. Gold uses plain strings; the catalog shows objects with additional_criteria_requirement_name (adjudication item)."
+    }
+  },
+  "$defs": {
+    "CTMLDrugItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "drug_name": {
+          "type": "string"
+        }
+      },
+      "description": "Catalog field (UI: No). Pipeline output policy: empty shell {} only."
+    },
+    "CTMLDrugList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "drug": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLDrugItem"
+          }
+        }
+      }
+    },
+    "CTMLManagementGroupItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "management_group_name": {
+          "type": "string",
+          "enum": [
+            "BCCA - Vancouver Cancer Centre",
+            "Princess Margaret Cancer Centre",
+            "Cancer Centre of Southeastern Ontario at Kingston General Hospital",
+            "London Health Sciences Centre",
+            "The Ottawa Hospital Cancer Centre",
+            "Juravinski Cancer Centre at Hamilton Health Sciences",
+            "Odette Cancer Centre - Sunnybrook Health Sciences Centre",
+            "Mount Sinai Hospital"
+          ]
+        },
+        "is_primary": {
+          "type": "string",
+          "enum": [
+            "Y",
+            "N"
+          ]
+        }
+      }
+    },
+    "CTMLManagementGroupList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "management_group": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLManagementGroupItem"
+          }
+        }
+      }
+    },
+    "CTMLSiteItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "site_name": {
+          "type": "string",
+          "enum": [
+            "BCCA - Vancouver Cancer Centre",
+            "Princess Margaret Cancer Centre",
+            "Cancer Centre of Southeastern Ontario at Kingston General Hospital",
+            "London Health Sciences Centre",
+            "The Ottawa Hospital Cancer Centre",
+            "Juravinski Cancer Centre at Hamilton Health Sciences",
+            "Odette Cancer Centre - Sunnybrook Health Sciences Centre",
+            "Mount Sinai Hospital"
+          ]
+        },
+        "site_status": {
+          "type": "string",
+          "enum": [
+            "Recruiting",
+            "Active, not recruiting",
+            "Not yet recruiting",
+            "Closed",
+            "Completed"
+          ]
+        },
+        "coordinating_center": {
+          "type": "string",
+          "enum": [
+            "Y",
+            "N"
+          ]
+        },
+        "uses_cancer_center_irb": {
+          "type": "string",
+          "enum": [
+            "Y",
+            "N"
+          ]
+        }
+      }
+    },
+    "CTMLSiteList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "site": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLSiteItem"
+          }
+        }
+      }
+    },
+    "CTMLSponsorItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sponsor_name"
+      ],
+      "properties": {
+        "sponsor_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "is_principal_sponsor": {
+          "type": "string",
+          "enum": [
+            "Y",
+            "N"
+          ]
+        }
+      }
+    },
+    "CTMLSponsorList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sponsor"
+      ],
+      "properties": {
+        "sponsor": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/CTMLSponsorItem"
+          }
+        }
+      }
+    },
+    "CTMLStaffItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Catalog: Don't extract. Output staff_list as {\"protocol_staff\": []}.",
+      "properties": {
+        "first_name": {
+          "type": "string"
+        },
+        "last_name": {
+          "type": "string"
+        },
+        "email_address": {
+          "type": "string"
+        },
+        "contact_number": {
+          "type": "string"
+        },
+        "institution_name": {
+          "type": "string",
+          "enum": [
+            "Princess Margaret Cancer Centre",
+            "Cancer Centre of Southeastern Ontario at Kingston General Hospital",
+            "London Health Sciences Centre",
+            "The Ottawa Hospital Cancer Centre",
+            "Juravinski Cancer Centre at Hamilton Health Sciences",
+            "Odette Cancer Centre - Sunnybrook Health Sciences Centre",
+            "Mount Sinai Hospital"
+          ]
+        },
+        "staff_role": {
+          "type": "string",
+          "enum": [
+            "Overall Principal Investigator",
+            "Clinical Trial Coordinator"
+          ]
+        }
+      }
+    },
+    "CTMLStaffList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_staff": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLStaffItem"
+          }
+        }
+      }
+    },
+    "CTMLTreatmentList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step"
+      ],
+      "properties": {
+        "step": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/CTMLStep"
+          }
+        }
+      }
+    },
+    "CTMLStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm"
+      ],
+      "properties": {
+        "arm": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/CTMLArm"
+          }
+        }
+      }
+    },
+    "CTMLArm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm_code",
+        "arm_description",
+        "dose_level"
+      ],
+      "description": "Not allowed (catalog hidden or system-generated): arm_internal_id, arm_type. match must be non-empty in the final CTML (checked by the release gate); the design branch may leave it empty.",
+      "properties": {
+        "arm_code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Arm title: part label + protocol arm title."
+        },
+        "arm_suspended": {
+          "type": "string",
+          "enum": [
+            "N",
+            "Y"
+          ]
+        },
+        "arm_description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "How this group differs / its purpose (design context, not a dose list)."
+        },
+        "uuid": {
+          "type": "string",
+          "description": "Hidden in the catalog. Pipeline writes a deterministic uuid5(trial_id, arm_code); never model-generated."
+        },
+        "dose_level": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/CTMLDoseLevel"
+          }
+        },
+        "match": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLMatchNode"
+          }
+        },
+        "arm_additional_criteria_not_captured": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CTMLAdditionalCriterion"
+          }
+        }
+      }
+    },
+    "CTMLAdditionalCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "additional_criteria_requirement_name"
+      ],
+      "properties": {
+        "additional_criteria_requirement_name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CTMLDoseLevel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level_code",
+        "level_description"
+      ],
+      "description": "Not allowed: level_internal_id, level_suspended (catalog hidden / UI: No).",
+      "properties": {
+        "level_code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Drug name, or Placebo."
+        },
+        "level_description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Dose, route, frequency (starting dose for escalation)."
+        }
+      }
+    },
+    "CTMLMatchNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "and": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CTMLMatchNode"
+              },
+              {
+                "$ref": "#/$defs/CTMLMatchLeaf"
+              }
+            ]
+          }
+        },
+        "or": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CTMLMatchNode"
+              },
+              {
+                "$ref": "#/$defs/CTMLMatchLeaf"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "CTMLMatchLeaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "clinical": {
+          "$ref": "#/$defs/CTMLClinicalLeaf"
+        },
+        "genomic": {
+          "$ref": "#/$defs/CTMLGenomicLeaf"
+        },
+        "prior_treatment": {
+          "$ref": "#/$defs/CTMLPriorTreatmentLeaf"
+        }
+      }
+    },
+    "CTMLClinicalLeaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Catalog clinical criteria. Not allowed: ecog_expression (not a catalog field; ECOG goes to additional text), tmb (hidden).",
+      "properties": {
+        "age_expression": {
+          "type": "string",
+          "pattern": "^(>=|<=|>|<)[0-9]+(\\.[0-9]+)?$",
+          "description": "Interval expression, e.g. >=18, <80."
+        },
+        "oncotree_primary_diagnosis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "OncoTree diagnosis (gold uses names; catalog says code: adjudication item), or _SOLID_ / _LIQUID_; ! prefix excludes.",
+          "pattern": "^!?\\S.*$"
+        },
+        "her2_status": {
+          "type": "string",
+          "enum": [
+            "Positive",
+            "Negative"
+          ]
+        },
+        "er_status": {
+          "type": "string",
+          "enum": [
+            "Positive",
+            "Negative"
+          ]
+        },
+        "pr_status": {
+          "type": "string",
+          "enum": [
+            "Positive",
+            "Negative"
+          ]
+        },
+        "llm_stage_group": {
+          "type": "string",
+          "enum": [
+            "Stage 0",
+            "Stage I",
+            "Stage II",
+            "Stage III",
+            "Stage IV",
+            "Stage V"
+          ]
+        },
+        "llm_class_t": {
+          "type": "string",
+          "enum": [
+            "TX",
+            "T0",
+            "Ta",
+            "Tis",
+            "T1",
+            "T2",
+            "T3",
+            "T4"
+          ]
+        },
+        "llm_class_n": {
+          "type": "string",
+          "enum": [
+            "N0",
+            "NX",
+            "N1",
+            "N2",
+            "N3"
+          ]
+        },
+        "llm_class_m": {
+          "type": "string",
+          "enum": [
+            "M0",
+            "M1"
+          ]
+        }
+      }
+    },
+    "CTMLGenomicLeaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hugo_symbol",
+        "variant_category"
+      ],
+      "description": "Catalog genomic criteria. Not allowed: ms_status, mmr_status and other signature fields (inactive in the catalog; keep MSI/MMR requirements as text), true_transcript_exon, variant_classification, molecular_function (hidden).",
+      "properties": {
+        "hugo_symbol": {
+          "type": "string",
+          "pattern": "^!?[A-Za-z0-9][A-Za-z0-9.-]*$",
+          "description": "HGNC symbol."
+        },
+        "variant_category": {
+          "type": "string",
+          "enum": [
+            "Mutation",
+            "!Mutation",
+            "CNV",
+            "Structural Variation"
+          ]
+        },
+        "protein_change": {
+          "type": "string",
+          "pattern": "^!?p\\..+$",
+          "description": "HGVS protein change (Mutation only)."
+        },
+        "wildcard_protein_change": {
+          "type": "string",
+          "pattern": "^!?p\\..+$",
+          "description": "e.g. p.G12 (Mutation only)."
+        },
+        "cnv_call": {
+          "type": "string",
+          "enum": [
+            "Heterozygous deletion",
+            "Homozygous deletion",
+            "Gain",
+            "High level amplification",
+            "!Heterozygous deletion",
+            "!Homozygous deletion",
+            "!Gain",
+            "!High level amplification"
+          ],
+          "description": "CNV only."
+        },
+        "fusion_partner_hugo_symbol": {
+          "type": "string",
+          "pattern": "^!?[A-Za-z0-9][A-Za-z0-9.-]*$",
+          "description": "Structural Variation only."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "variant_category": {
+                "enum": [
+                  "Mutation",
+                  "!Mutation"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "cnv_call": false,
+              "fusion_partner_hugo_symbol": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "variant_category": {
+                "const": "CNV"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protein_change": false,
+              "wildcard_protein_change": false,
+              "fusion_partner_hugo_symbol": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "variant_category": {
+                "const": "Structural Variation"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protein_change": false,
+              "wildcard_protein_change": false,
+              "cnv_call": false
+            }
+          }
+        }
+      ]
+    },
+    "CTMLPriorTreatmentLeaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "treatment_category"
+      ],
+      "description": "Catalog prior treatment. treatment_category first; children depend on it. Not allowed: subtype, radiation_type (hidden), washout (not a catalog field; time-limited exclusions stay as text).",
+      "properties": {
+        "treatment_category": {
+          "type": "string",
+          "enum": [
+            "Medical Therapy",
+            "Surgery",
+            "Radiation Therapy",
+            "Stem Cell Transplant",
+            "CAR-T Therapy"
+          ]
+        },
+        "agent_class": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NCI Thesaurus class; ! prefix excludes. Medical Therapy only."
+        },
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Drug name; ! prefix excludes. Medical Therapy only."
+        },
+        "surgery_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Procedure; ! prefix excludes. Surgery only."
+        },
+        "radiation_site": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Site; ! prefix excludes. Radiation Therapy only."
+        },
+        "transplant_type": {
+          "type": "string",
+          "enum": [
+            "Allogeneic",
+            "Autologous",
+            "!Allogeneic",
+            "!Autologous"
+          ],
+          "description": "Stem Cell Transplant only."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "treatment_category": {
+                "const": "Medical Therapy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "surgery_type": false,
+              "radiation_site": false,
+              "transplant_type": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "treatment_category": {
+                "const": "Surgery"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "agent_class": false,
+              "agent": false,
+              "radiation_site": false,
+              "transplant_type": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "treatment_category": {
+                "const": "Radiation Therapy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "agent_class": false,
+              "agent": false,
+              "surgery_type": false,
+              "transplant_type": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "treatment_category": {
+                "const": "Stem Cell Transplant"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "agent_class": false,
+              "agent": false,
+              "surgery_type": false,
+              "radiation_site": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "treatment_category": {
+                "const": "CAR-T Therapy"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "agent_class": false,
+              "agent": false,
+              "surgery_type": false,
+              "radiation_site": false,
+              "transplant_type": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

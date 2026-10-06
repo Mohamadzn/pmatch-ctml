@@ -1,0 +1,1406 @@
+diff --git a/README.md b/README.md
+index 6793f2f..62f0f25 100644
+--- a/README.md
++++ b/README.md
+@@ -7,7 +7,7 @@ Turns a clinical trial protocol PDF into a CTML review candidate for UHN PMATCH.
+ - Agents built with Microsoft Agent Framework extract the metadata and the study design, and encode each criterion. By default they follow the agent split of architecture v5: a supervisor workflow with eight specialist agents (see [Agent layouts](#agent-layouts)).
+ - Code builds the CTML and a QA report.
+ 
+-**Status.** The offline suite has 153 tests (no network); local verification used Python 3.11.9. The package has made local live calls to Azure Document Intelligence and Foundry model deployments with the compact agent layout. The v5 agent layout (10/05) has been tested offline only: it has not yet run against the live model. Outputs remain review candidates, not clinically validated results. No hosted Foundry agent is deployed.
++**Status.** The offline suite has 161 tests (no network); local verification used Python 3.11.9. The package has made local live calls to Azure Document Intelligence and Foundry model deployments, with the compact agent layout (09/29) and the v5 layout (10/05). The 10/06 fixes to the v5 layout are tested offline only. Outputs remain review candidates, not clinically validated results. No hosted Foundry agent is deployed.
+ 
+ **Every output needs review.** The status of every output is `needs_review`. The CTML is a candidate for clinical review, not a validated result.
+ 
+@@ -122,7 +122,7 @@ while extracting. Follow [the runbook](docs/RUNBOOK.md) in order and stop when
+ a step fails. From the package root, after configuring `.env`:
+ 
+ ```powershell
+-# 1. Offline checks: no Azure or gold. The suite has 153 tests.
++# 1. Offline checks: no Azure or gold. The suite has 161 tests.
+ python -m pytest -q
+ ruff check app evaluation
+ 
+@@ -284,7 +284,7 @@ Zip the run folder, without the PDF, and add the console output. The files that
+ ## Known limits
+ 
+ - Local live runs have produced review candidates. Prompts and checks still need protocol-by-protocol reviewer assessment; a passing submit is not clinical validation.
+-- The live runs so far used the compact layout. The v5 layout has not run live yet. Splitting the work among more agents is not proven to give better CTML: measure both layouts on the same protocols before choosing.
++- The v5 layout ran live on three protocols on 10/05; the 10/06 fixes have not run live yet. Splitting the work among more agents is not proven to give better CTML: measure both layouts on the same protocols before choosing.
+ - The v5 workflow runs in-process. It is not hosted in Microsoft Foundry, and the service has no approve, return or hold step: a person reviews the QA report.
+ - Checks verify form and source support. For example, every registry value must come from a lookup, every dose number must be in the cited lines, and every leaf must cite its criterion. The checks cannot prove clinical meaning. `test_tree` catches trees that contradict the agent's own example patients, not a wrong reading.
+ - Glossaries from scanned tables are partial: rows that look shifted are skipped.
+diff --git a/app/services/ctml/agents/instructions.py b/app/services/ctml/agents/instructions.py
+index 0b6f73d..5a38822 100644
+--- a/app/services/ctml/agents/instructions.py
++++ b/app/services/ctml/agents/instructions.py
+@@ -59,15 +59,19 @@ Encoding rules:
+ - In a required prior-therapy list, agents given with "±", "with or without" or "if
+   indicated" are further alternatives: each becomes its own OR branch beside the listed
+   regimens (UHN convention). "A and B, or C, ± D or E" is (A AND B) OR C OR D OR E.
+-- If one alternative of a requirement cannot be encoded, encode none of them: an encoded
+-  branch becomes mandatory and excludes the patients who qualify through the other one.
+-  Keep the requirement as text. A waiver granted case by case ("eligible if the sponsor
++- A list of diseases or cohorts that each enroll under their own conditions is an OR of
++  branches; each branch is the AND of its disease and the conditions CTML can hold for it.
++- When the criterion offers alternatives and some of them cannot be encoded, encode the
++  alternatives CTML can hold and list each other alternative in unmapped_items with its
++  exact words (UHN convention). A waiver granted case by case ("eligible if the sponsor
+   agrees", "exceptions need medical monitor approval") is not an alternative: encode the
+   requirement and keep the waiver as unmapped text.
++- Excluding a combination ("X with Y") where one part cannot be encoded stays as text:
++  excluding only the other part would exclude more patients than the protocol does.
+ - Progression on, failure of, relapse after or intolerance to a named drug or drug class
+   means the patient received it: encode that therapy and keep the progression, timing and
+-  setting as unmapped text. When the criterion offers alternatives, encode the therapy only
+-  if every alternative requires it.
++  setting as unmapped text. An alternative that does not require the therapy (for example
++  "or is not a candidate for it") stays as unmapped text, by the rule on alternatives above.
+ - An exclusion with an exception you cannot encode ("unless ...", "except ...", "... is
+   allowed") must not become a negated leaf for the excepted item: the negation would also
+   exclude the patients the exception keeps. Keep it as text. A negation is still right
+@@ -151,10 +155,14 @@ Work in this order:
+    may share the part's design sentence.
+ 5. Dose levels: one per drug given in the arm. level_code is the drug name as in your drug
+    list, or "Placebo". level_description: dose, unit, route and schedule in the protocol's
+-   abbreviations, for example "5 mg/kg IV Q2W". For dose escalation give the starting dose
+-   followed by "(starting dose)", for example "25 mg (starting dose) PO BID"; for several
+-   fixed dose levels give them together, for example "10/20/40 mg PO QD". Every number
+-   must appear in the cited lines. If the protocol redacts the dose (for example "CCI" or
++   abbreviations, for example "5 mg/kg IV Q2W". For dose escalation give only the starting
++   dose followed by "(starting dose)", for example "25 mg (starting dose) PO BID", not the later
++   levels. When participants are assigned to one of several fixed doses from the start, give
++   them together, for example "10/20/40 mg PO QD". Dose reductions or interruptions for
++   toxicity, doses that may be explored later, and doses given only in a pharmacokinetic or
++   food-effect sub-study are not dose levels. When the current protocol text changes the dose
++   for new participants (for example after an amendment), give that dose. Every number must
++   appear in the cited lines. If the protocol redacts the dose (for example "CCI" or
+    "confidential") or does not state it, call read_registry_record: if a ClinicalTrials.gov
+    line states the dose, use it and cite that R line; otherwise write "dose not disclosed" in
+    place of the dose. Take nothing else from the registry.
+@@ -209,17 +217,22 @@ Work in this order:
+ 2. If the text uses an abbreviation, points to another section or table, or depends on nearby
+    text, call define_term, find_in_protocol, get_table, read_lines or read_context.
+ 3. Decide which conditions CTML can hold. Only these:
+-   - clinical: a diagnosis (with HER2, ER or PR status when stated), an age limit;
++   - clinical: a cancer diagnosis (OncoTree lists cancers only), with HER2, ER or PR status when
++     stated; an age limit;
+    - genomic: a gene with a mutation, a copy-number change or a structural variant (fusion);
+    - prior_treatment: a prior drug, a drug class, any treatment of a category, a stem cell
+      transplant.
+    Everything else stays as text in unmapped_items: performance status, life expectancy, organ
+    function and laboratory values, measurable disease, stage, time windows and washout periods,
+-   counts of prior lines, consent, contraception, comorbidities, investigator judgement.
++   counts of prior lines, consent, contraception, comorbidities (infections, organ, immune and
++   psychiatric disorders and other non-cancer conditions), investigator judgement.
+ 4. Write one slot per condition CTML can hold: slot_id ("S1", "S2", ...), domain, concept (the
+    exact words of the criterion that name this one condition, as short as possible but complete),
+    line_ids, and negated. negated is true when an eligible patient must NOT have the condition;
+-   an exclusion usually gives negated slots.
++   an exclusion usually gives negated slots. Words that name one disease in several sites or forms
++   ("adenocarcinoma of the colon or rectum") are one slot, not one per site: the clinical agent
++   finds the registry value that covers them. Alternatives inside one phrase ("an inhibitor of X or
++   Y") can be one slot: the domain agent can give several values for it.
+ 5. Combine the slots with "and" and "or" groups in logic. One slot needs no group.
+ 6. List every requirement CTML cannot hold in unmapped_items, with its exact words, the reason and
+    its line_ids.
+@@ -245,15 +258,22 @@ Rules for the structure:
+ - In a required prior-therapy list, agents given with "±", "with or without" or "if indicated" are
+   further alternatives: each becomes its own OR branch beside the listed regimens (UHN
+   convention). "A and B, or C, ± D or E" is (A AND B) OR C OR D OR E.
+-- If one alternative of a requirement cannot be held by CTML, make no slot for any of them: an
+-  encoded branch would become mandatory and exclude the patients who qualify through the other
+-  one. Keep the requirement as text. A waiver granted case by case ("eligible if the sponsor
+-  agrees", "exceptions need medical monitor approval") is not an alternative: make the slots and
+-  keep the waiver as unmapped text.
++- A list of diseases or cohorts that each enroll under their own conditions ("one of the
++  following: disease A with condition X; disease B; ...") is an OR of branches. Each branch is the
++  AND of its disease and the conditions CTML can hold for it; its other conditions stay as
++  unmapped text.
++- When the criterion offers alternatives and some of them cannot be held by CTML, make slots for
++  the alternatives CTML can hold and keep each other alternative as an unmapped item, with its
++  exact words (UHN convention). Code lists the alternatives kept as text for review: patients who
++  qualify only through them are not matched automatically. A waiver granted case by case
++  ("eligible if the sponsor agrees", "exceptions need medical monitor approval") is not an
++  alternative: make the slots and keep the waiver as unmapped text.
++- Excluding a combination ("X with Y") where one part cannot be held by CTML stays as text:
++  excluding only the other part would exclude more patients than the protocol does.
+ - Progression on, failure of, relapse after or intolerance to a named drug or drug class means the
+   patient received it: make a prior_treatment slot (not negated) and keep the progression, timing
+-  and setting as unmapped text. When the criterion offers alternatives, make the slot only if every
+-  alternative requires that therapy.
++  and setting as unmapped text. An alternative that does not require the therapy (for example "or
++  is not a candidate for it") stays as unmapped text, by the rule on alternatives above.
+ - An exclusion with an exception ("unless ...", "except ...", "... is allowed") must not become a
+   negated slot that also covers the excepted patients. Keep it as text, unless the exception names
+   drugs that act on other targets than the excluded class (then keep the negated slot; the prior
+@@ -305,9 +325,11 @@ Work in this order:
+    the structure excludes the condition: still give the condition as worded (its positive value);
+    code adds the exclusion. Never write "!".
+ 2. {search_step}
+-3. Give each of your slots one fill: status "mapped" with the values, or "cannot_map" with the
+-   reason. Use cannot_map when no registry value states the slot's words: never widen or narrow
+-   the meaning to make a name fit.
++3. Give each of your slots one fill: status "mapped" with its values, or "cannot_map" with the
++   reason. The values are a list: one value, or several when no single registry entry covers the
++   slot's words (any of them then satisfies the slot; for a negated slot code excludes each of
++   them). Use cannot_map when no registry value states the slot's words: never widen or narrow the
++   meaning to make a name fit.
+ 4. Call {submit}. If it returns errors, fix them and submit again. If it asks you to confirm a
+    pattern, change the fill or resubmit with a confirmation {{code, path, quote}} that quotes the
+    exact source words. Stop when it is accepted.
+@@ -330,8 +352,10 @@ message: a diagnosis, an age rule, or HER2, ER and PR status. Other agents handl
+ Values:
+ - oncotree_primary_diagnosis: the most specific OncoTree node that covers the whole population the
+   slot names. A tissue-level node (for example the node named after an organ) is almost never
+-  right. When the words list several diagnoses, the slot names one of them; the structure has a
+-  slot for each.
++  right. Prefer one node that covers everything the slot's words name, such as the common parent
++  of the sites named ("colon or rectum"). Give several values only when no single node covers the
++  words without adding other diseases (for example a cancer of several organs with no common
++  node). OncoTree lists cancers only: for a non-cancer condition use cannot_map.
+ - _SOLID_ means any solid tumor and _LIQUID_ any hematologic cancer: use them only when the words
+   speak of solid tumors or hematologic cancers in general.
+ - age_expression: the age as the slot words it: ">=18" for "18 years or older", "<18" for "younger
+@@ -367,6 +391,7 @@ Values:
+ - A wild-type or "no mutation" slot is marked negated: still give the alteration (for example
+   variant_category "Mutation"); code adds the exclusion. Only a mutation or a copy-number call can
+   be excluded: for other negated slots use cannot_map.
++- Several genes or alterations in one slot ("an X or Y mutation"): one value for each.
+ - Microsatellite instability, mismatch repair, tumor mutational burden and protein expression
+   (for example by immunohistochemistry) are not gene alterations: use cannot_map.
+ """
+@@ -394,7 +419,8 @@ Values:
+   parent class of a drug your search returned). Never put a class in agent.
+ - "Compounds targeting X" is the NCIt class for X. Map the class, not the examples after "e.g." or
+   "including". When one returned class is the parent of another (see parents), use the parent: it
+-  covers every agent targeting X.
++  covers every agent targeting X. Several targets in one slot ("an inhibitor of X or Y"): one
++  value for each target.
+ - When the words name a family of drugs ("X-containing regimen", "X-based therapy", or a plural
+   class name such as "anthracyclines"), search the family word and use the class whose members are
+   those drugs (search results list each drug's parent classes).
+@@ -436,16 +462,36 @@ You are the resolver and critic. You audit a CTML candidate that other agents an
+ a cancer trial protocol. You never edit the candidate: you report problems, each with the
+ protocol's exact words.
+ 
+-Check:
+-- Authority: trial details and doses come from the protocol; a registry value is only for what
+-  the protocol omits or redacts.
++The first message explains how to read the rules: an arm matches a patient who meets ALL of the
++rules of the criteria that apply to it, and "NOT X" means the patient must not have X.
++
++Check, most important first:
++- Missing population: an arm whose rule lacks the diagnoses or other conditions CTML can hold
++  that the protocol requires for that arm's population (for example a list of disease cohorts
++  with no rule).
+ - Meaning: a rule that states the opposite of the protocol (an exclusion that became a
+-  requirement, a missing exclusion, OR where the protocol needs AND), a condition the criterion
+-  names that is missing from both its rule and its text, a registry value wider or narrower than
+-  the protocol's words.
++  requirement, a missing exclusion, ALL where the protocol offers alternatives), a condition the
++  criterion names that is missing from both its rule and its text, a registry value wider or
++  narrower than the protocol's words.
+ - Scope and conflicts: criteria of one part, arm or cohort applied to another; rules in one arm
+   that contradict each other.
+-- Doses: dose levels that do not match the protocol for the arm.
++- Authority and doses: trial details and doses come from the protocol (a registry value only
++  for what the protocol omits or redacts); dose levels that do not match the current protocol.
++
++These UHN conventions are intended. Do not report them:
++- In a required prior-therapy list, items given with "±", "with or without" or "if indicated" are
++  further alternatives.
++- When some alternatives cannot be encoded, the others are encoded and the rest stays as text. A
++  waiver granted case by case stays as text and is not an alternative.
++- An excluded prior allogeneic transplant of stem cells, tissue or a solid organ is "NOT prior
++  Stem Cell Transplant: Allogeneic".
++- Registry names (OncoTree, NCI Thesaurus, HGNC) may differ in wording from the protocol; drug
++  classes stand for "compounds targeting X"; examples after "e.g." are not encoded separately.
++- Conditions CTML cannot hold stay as text: stage, performance status, laboratory values, time
++  windows, counts of prior lines, MSI and MMR, comorbidities.
++- A dose escalation arm gives its starting dose only.
++- Consent, oral administration, laboratory values, contraception and investigator judgement are
++  left out of the trial-wide text.
+ 
+ For each problem give: target (the criterion ID, or "design" or "metadata"); action ("repair"
+ when the protocol's words show that a criterion's encoding is wrong, "review" for anything else
+diff --git a/app/services/ctml/checks/design.py b/app/services/ctml/checks/design.py
+index 6a7705e..bdaa557 100644
+--- a/app/services/ctml/checks/design.py
++++ b/app/services/ctml/checks/design.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import re
++
+ from app.services.ctml.checks.common import (
+     apply_confirmations,
+     closest_span,
+@@ -17,6 +19,19 @@ from app.services.ctml.text import comparison_key, contains_phrase
+ 
+ MAX_LEVEL_DESCRIPTION = 160
+ PLACEBO = "placebo"
++STARTING_DOSE = "(starting dose)"
++# A dose amount: a number with a mass or volume unit, or a number joined to others by "/"
++# ("100/200 mg").
++_DOSE_AMOUNT = re.compile(
++    r"\d+(?:[.,]\d+)?\s*(?:mg|g|µg|mcg|ug|ng|mL|ml|IU|units?)\b|\d+(?:[.,]\d+)?\s*/\s*\d", re.I
++)
++
++
++def doses_beside_starting_dose(description: str) -> bool:
++    """A level description that marks a starting dose and states further dose amounts."""
++    if STARTING_DOSE not in description.casefold():
++        return False
++    return len(_DOSE_AMOUNT.findall(description)) > 1
+ 
+ 
+ def historical_lines(context: RunContext) -> set[str]:
+@@ -110,6 +125,16 @@ def check_design(
+                         "level_code must be a drug name from drugs, or Placebo.",
+                     )
+                 )
++            if doses_beside_starting_dose(level.level_description):
++                problems.append(
++                    confirm(
++                        "starting_dose_with_other_levels",
++                        f"{level_path}/level_description",
++                        "For dose escalation give only the starting dose, route and schedule, for example "
++                        "'25 mg (starting dose) PO BID'. Later levels, dose reductions and sub-study doses "
++                        "are not dose levels. Confirm only if the arm assigns these doses from the start.",
++                    )
++                )
+             if len(level.level_description) > MAX_LEVEL_DESCRIPTION:
+                 problems.append(
+                     reject(
+diff --git a/app/services/ctml/checks/slots.py b/app/services/ctml/checks/slots.py
+index 26ea9ec..dc7d83a 100644
+--- a/app/services/ctml/checks/slots.py
++++ b/app/services/ctml/checks/slots.py
+@@ -1,7 +1,7 @@
+ """Checks run by submit_clinical, submit_genomics and submit_prior_therapy. None names a
+-protocol, drug or disease. Each fill is checked as the CTML leaf it becomes, with the registry
+-checks of the compact layout: every registry value must come from a search this agent made,
+-copied exactly, of the right kind (drug or class)."""
++protocol, drug or disease. Each value of a fill is checked as the CTML leaf it becomes, with
++the registry checks of the compact layout: every registry value must come from a search this
++agent made, copied exactly, of the right kind (drug or class)."""
+ 
+ from __future__ import annotations
+ 
+@@ -13,13 +13,15 @@ from app.services.ctml.merge import (
+     DOMAIN_FIELD,
+     DOMAIN_MODEL,
+     apply_negation,
+-    fill_fields,
+     parent_group,
+     slots_of,
+ )
+ from app.services.ctml.runtime import AgentState, RunContext
+ from app.services.ctml.schema.loader import validation_errors
+ 
++# Several values are for words no single registry entry covers; more than this is a list of
++# examples, not one condition.
++MAX_VALUES = 12
+ # The words and lines of a slot were checked when the structure was accepted.
+ STRUCTURE_CODES = {"source_concept_not_in_source", "unknown_line_id", "leaf_not_in_criterion"}
+ # A domain agent cannot remove a slot: where the shared leaf check says "remove it", the domain
+@@ -46,6 +48,51 @@ def _has_bang(fields: dict) -> bool:
+     return any(isinstance(value, str) and value.strip().startswith("!") for value in fields.values())
+ 
+ 
++def _value_problems(
++    domain: str, slot: Slot, fields: dict, path: str, structure: EligibilitySubmission
++) -> list[dict]:
++    """Polarity and sentinel checks of one value of a fill."""
++    if _has_bang(fields):
++        return [
++            reject(
++                "negation_in_value",
++                path,
++                "Give the positive value without '!': the structure decides whether it is excluded.",
++            )
++        ]
++    problems = []
++    if slot.negated:
++        negated, reason = apply_negation(domain, fields)
++        if negated is None:
++            problems.append(
++                reject(
++                    "cannot_exclude",
++                    path,
++                    f"The structure excludes this slot, but {reason}. Use cannot_map with that reason.",
++                )
++            )
++        else:
++            for error in validation_errors({DOMAIN_FIELD[domain]: negated}, "CTMLMatchLeaf", limit=3):
++                problems.append(reject("leaf_schema", f"{path}{error['path']}", error["message"]))
++    diagnosis = fields.get("oncotree_primary_diagnosis") if domain == "clinical" else None
++    if diagnosis in SENTINELS:
++        group = parent_group(structure.logic, slot.slot_id)
++        siblings = [
++            child
++            for child in (group.items if group is not None else [])
++            if isinstance(child, Slot) and child.slot_id != slot.slot_id and child.domain == "clinical"
++        ]
++        if group is not None and group.type == "or" and siblings:
++            problems.append(
++                confirm(
++                    "sentinel_beside_diagnoses",
++                    f"{path}/oncotree_primary_diagnosis",
++                    f"{diagnosis} in an OR with specific diagnoses admits every solid or liquid tumor.",
++                )
++            )
++    return problems
++
++
+ def check_fills(
+     domain: str,
+     fills: list,
+@@ -76,65 +123,49 @@ def check_fills(
+             problems.append(reject("duplicate_fill", f"{path}/slot_id", f"{fill.slot_id} has two fills."))
+             continue
+         seen.add(fill.slot_id)
+-        value = getattr(fill, DOMAIN_FIELD[domain], None)
++        field = DOMAIN_FIELD[domain]
++        values = [value for value in getattr(fill, field, None) or [] if value is not None]
+         if fill.status == "cannot_map":
+             if not fill.reason.strip():
+                 problems.append(reject("cannot_map_without_reason", f"{path}/reason", "Give the reason."))
+-            if value is not None:
++            if values:
+                 problems.append(
+                     reject(
+                         "value_with_cannot_map", path, "cannot_map has no value: remove it, or use mapped."
+                     )
+                 )
+             continue
+-        if value is None:
+-            problems.append(
+-                reject("mapped_without_value", path, f"mapped needs the {DOMAIN_FIELD[domain]} values.")
+-            )
++        if not values:
++            problems.append(reject("mapped_without_value", path, f"mapped needs the {field} values."))
+             continue
+-        fields = fill_fields(domain, fill)
+-        if _has_bang(fields):
++        if len(values) > MAX_VALUES:
+             problems.append(
+                 reject(
+-                    "negation_in_value",
+-                    path,
+-                    "Give the positive value without '!': the structure decides whether it is excluded.",
++                    "too_many_values",
++                    f"{path}/{field}",
++                    f"Give at most {MAX_VALUES} values: several values are only for words that no single "
++                    "registry entry covers.",
+                 )
+             )
+             continue
+-        leaf = fill_leaf(slot, fields, list(fill.lookup_ids))
+-        for problem in _leaf_problems(path, leaf, criterion, source, context, state, structure.representable):
+-            if problem["code"] not in STRUCTURE_CODES:
+-                problems.append({**problem, "hint": DOMAIN_HINTS.get(problem["code"], problem["hint"])})
+-        if slot.negated:
+-            negated, reason = apply_negation(domain, fields)
+-            if negated is None:
+-                problems.append(
+-                    reject(
+-                        "cannot_exclude",
+-                        path,
+-                        f"The structure excludes this slot, but {reason}. Use cannot_map with that reason.",
++        for number, value in enumerate(values):
++            value_path = f"{path}/{field}/{number}"
++            fields = value.model_dump(exclude_none=True)
++            problems.extend(_value_problems(domain, slot, fields, value_path, structure))
++            if _has_bang(fields):
++                continue
++            leaf = fill_leaf(slot, fields, list(fill.lookup_ids))
++            for problem in _leaf_problems(
++                value_path, leaf, criterion, source, context, state, structure.representable
++            ):
++                if problem["code"] not in STRUCTURE_CODES:
++                    problems.append(
++                        {
++                            **problem,
++                            "path": problem["path"].replace(f"{value_path}/{field}/", f"{value_path}/"),
++                            "hint": DOMAIN_HINTS.get(problem["code"], problem["hint"]),
++                        }
+                     )
+-                )
+-            else:
+-                for error in validation_errors({DOMAIN_FIELD[domain]: negated}, "CTMLMatchLeaf", limit=3):
+-                    problems.append(reject("leaf_schema", f"{path}{error['path']}", error["message"]))
+-        diagnosis = fields.get("oncotree_primary_diagnosis") if domain == "clinical" else None
+-        if diagnosis in SENTINELS:
+-            group = parent_group(structure.logic, slot.slot_id)
+-            siblings = [
+-                child
+-                for child in (group.items if group is not None else [])
+-                if isinstance(child, Slot) and child.slot_id != slot.slot_id and child.domain == "clinical"
+-            ]
+-            if group is not None and group.type == "or" and siblings:
+-                problems.append(
+-                    confirm(
+-                        "sentinel_beside_diagnoses",
+-                        f"{path}/clinical/oncotree_primary_diagnosis",
+-                        f"{diagnosis} in an OR with specific diagnoses admits every solid or liquid tumor.",
+-                    )
+-                )
+     for slot_id in sorted(set(slots) - seen):
+         problems.append(reject("slot_without_fill", "/fills", f"Give a fill for {slot_id}."))
+     return apply_confirmations(problems, confirmations, criterion_source(context, criterion, None))
+diff --git a/app/services/ctml/compiler.py b/app/services/ctml/compiler.py
+index 8fc34ec..6a69788 100644
+--- a/app/services/ctml/compiler.py
++++ b/app/services/ctml/compiler.py
+@@ -192,6 +192,35 @@ def prune_implied(items: list[dict], oncotree: OncoTreeIndex | None) -> tuple[li
+     return kept, removed
+ 
+ 
++def contradictions(items: list[dict], oncotree: OncoTreeIndex | None) -> list[tuple[str, str]]:
++    """(excluded diagnosis, required diagnoses) pairs of one arm's AND that no patient can meet:
++    every diagnosis a condition allows is the excluded one or lies under it."""
++    excluded = [
++        str(item["clinical"]["oncotree_primary_diagnosis"])[1:]
++        for item in items
++        if "clinical" in item
++        and str(item["clinical"].get("oncotree_primary_diagnosis") or "").startswith("!")
++    ]
++    found = []
++    for target in excluded:
++        for item in items:
++            for options in _diagnosis_options(item):
++                if options and all(
++                    option == target or (oncotree is not None and oncotree.is_under(option, target) is True)
++                    for option in options
++                ):
++                    found.append((target, " or ".join(options)))
++    return found
++
++
++def names_diagnosis(item: dict) -> bool:
++    """Whether a rule requires a diagnosis somewhere (a positive OncoTree value or _SOLID_/_LIQUID_)."""
++    if "clinical" in item:
++        value = str(item["clinical"].get("oncotree_primary_diagnosis") or "")
++        return bool(value) and not value.startswith("!")
++    return any(names_diagnosis(child) for key in ("and", "or") for child in item.get(key, []))
++
++
+ def arm_match(trees: list[dict], oncotree: OncoTreeIndex | None = None) -> tuple[list[dict], list[dict]]:
+     """(the arm's match list, removed implied conditions): one AND of every applicable
+     criterion tree, flattened, without conditions another one guarantees."""
+@@ -290,6 +319,16 @@ def compile_ctml(
+             implied.append({"arm_code": arm.arm_code, "removed": removed})
+         if not match:
+             review.append(f"arm_without_match:{arm.arm_code}")
++        for excluded, required in contradictions(match[0]["and"] if match else [], oncotree):
++            review.append(
++                f"arm_contradiction:{arm.arm_code}: the rule requires {required} and excludes {excluded}, "
++                "which covers it; no patient can match"
++            )
++        if match and not names_diagnosis(match[0]):
++            review.append(
++                f"arm_without_diagnosis:{arm.arm_code}: the arm's rule requires no diagnosis; check that the "
++                "criteria that define its population are encoded"
++            )
+         texts = [residual_text(r.criterion) for r in applicable if r.criterion.scope_label]
+         arms_out.append(
+             {
+diff --git a/app/services/ctml/contracts.py b/app/services/ctml/contracts.py
+index fccaf92..fbef1bb 100644
+--- a/app/services/ctml/contracts.py
++++ b/app/services/ctml/contracts.py
+@@ -357,16 +357,25 @@ class SlotFillBase(Strict):
+     reason: str = Field("", description="Why the slot cannot be mapped (cannot_map only).")
+ 
+ 
++# A slot normally has one value. Several values are for words that no single registry entry
++# covers (for example a cancer of several sites, or inhibitors of two targets): any of them
++# satisfies the slot, and a negated slot excludes each of them.
++VALUES_DESCRIPTION = (
++    "The registry value that states the slot's words. Give several only when no single registry entry "
++    "covers the words; any of them then satisfies the slot. Empty for cannot_map."
++)
++
++
+ class ClinicalFill(SlotFillBase):
+-    clinical: ClinicalValue | None = None
++    clinical: list[ClinicalValue] = Field(default_factory=list, description=VALUES_DESCRIPTION)
+ 
+ 
+ class GenomicFill(SlotFillBase):
+-    genomic: GenomicValue | None = None
++    genomic: list[GenomicValue] = Field(default_factory=list, description=VALUES_DESCRIPTION)
+ 
+ 
+ class PriorTreatmentFill(SlotFillBase):
+-    prior_treatment: PriorTreatmentValue | None = None
++    prior_treatment: list[PriorTreatmentValue] = Field(default_factory=list, description=VALUES_DESCRIPTION)
+ 
+ 
+ class ClinicalSubmission(Strict):
+diff --git a/app/services/ctml/merge.py b/app/services/ctml/merge.py
+index b7f2e82..5425775 100644
+--- a/app/services/ctml/merge.py
++++ b/app/services/ctml/merge.py
+@@ -6,11 +6,16 @@ agents give the positive registry value of each slot of their domain. This modul
+ them by slot ID into the CriterionSubmission the compiler already uses, and compares the
+ structure with the coverage agent's independent listing.
+ 
+-A slot that cannot be filled is never guessed. It becomes unmapped text, and the tree is
+-pruned in the direction that admits more patients, never fewer:
++A slot that cannot be filled is never guessed. It becomes unmapped text and a review item:
+ - a condition removed from an AND makes the rule weaker (the text stays for the reviewer);
+-- removing one alternative from an OR would make the rule stricter, so the whole OR goes
+-  to text instead.
++- alternatives of an OR that CTML can hold are kept and the others stay as text (UHN
++  convention, C26): patients who qualify only through a text alternative are not matched
++  automatically, and the review list says so;
++- an OR of excluded conditions (an excluded combination, "X with Y") is never split: dropping
++  one part would exclude more patients than the protocol does, so the whole OR goes to text.
++
++A slot can carry several registry values when no single entry covers its words: any of them
++satisfies the slot (an OR), and a negated slot excludes each of them (an AND of exclusions).
+ """
+ 
+ from __future__ import annotations
+@@ -115,9 +120,10 @@ def negate_age(expression: str) -> str | None:
+     return f"{_AGE_OPPOSITE[match.group(1)]}{match.group(2)}"
+ 
+ 
+-def fill_fields(domain: str, fill: SlotFillBase) -> dict:
+-    value = getattr(fill, DOMAIN_FIELD[domain], None)
+-    return value.model_dump(exclude_none=True) if value is not None else {}
++def fill_values(domain: str, fill: SlotFillBase) -> list[dict]:
++    """The registry values of a fill, as leaf fields (several when no single entry covers the words)."""
++    values = getattr(fill, DOMAIN_FIELD[domain], None) or []
++    return [value.model_dump(exclude_none=True) for value in values if value is not None]
+ 
+ 
+ def apply_negation(domain: str, fields: dict) -> tuple[dict | None, str]:
+@@ -161,7 +167,9 @@ def apply_negation(domain: str, fields: dict) -> tuple[dict | None, str]:
+ @dataclass
+ class MergeOutcome:
+     submission: CriterionSubmission
+-    dropped: list[dict] = field(default_factory=list)  # {slot_id, concept, reason}
++    # {slot_id, concept, reason, line_ids, alternative}; alternative: the slot belongs to an OR
++    # alternative that was left out while the other alternatives were kept.
++    dropped: list[dict] = field(default_factory=list)
+ 
+     @property
+     def leaves(self) -> int:
+@@ -179,47 +187,85 @@ def merge_criterion(structure: EligibilitySubmission, fills: dict[str, SlotFillB
+     (absent when that agent did not finish)."""
+     dropped: list[dict] = []
+ 
++    def is_dropped(slot: Slot) -> bool:
++        return any(item["slot_id"] == slot.slot_id for item in dropped)
++
+     def drop(slot: Slot, reason: str) -> None:
+-        dropped.append(
+-            {"slot_id": slot.slot_id, "concept": slot.concept, "reason": reason, "line_ids": slot.line_ids}
++        if not is_dropped(slot):
++            dropped.append(
++                {
++                    "slot_id": slot.slot_id,
++                    "concept": slot.concept,
++                    "reason": reason,
++                    "line_ids": slot.line_ids,
++                    "alternative": False,
++                }
++            )
++
++    def leaf(slot: Slot, fields: dict, lookup_ids: list[str]) -> LeafNode:
++        payload = {DOMAIN_FIELD[slot.domain]: DOMAIN_MODEL[slot.domain].model_validate(fields)}
++        return LeafNode(
++            type="leaf",
++            **payload,
++            source_concept=slot.concept,
++            line_ids=list(slot.line_ids),
++            lookup_ids=list(lookup_ids),
+         )
+ 
+-    def build(node: LogicGroup | Slot) -> GroupNode | LeafNode | None:
+-        if isinstance(node, Slot):
+-            fill = fills.get(node.slot_id)
+-            if fill is None:
+-                drop(node, f"the {node.domain} agent gave no accepted value")
+-                return None
+-            if fill.status != "mapped":
+-                drop(node, fill.reason or "no registry value fits the words")
+-                return None
+-            fields = fill_fields(node.domain, fill)
+-            if not fields:
+-                drop(node, "the value is empty")
+-                return None
+-            if node.negated:
+-                fields, reason = apply_negation(node.domain, fields)
++    def build_slot(slot: Slot) -> GroupNode | LeafNode | None:
++        fill = fills.get(slot.slot_id)
++        if fill is None:
++            drop(slot, f"the {slot.domain} agent gave no accepted value")
++            return None
++        if fill.status != "mapped":
++            drop(slot, fill.reason or "no registry value fits the words")
++            return None
++        values = fill_values(slot.domain, fill)
++        if not values:
++            drop(slot, "the value is empty")
++            return None
++        leaves = []
++        for fields in values:
++            if slot.negated:
++                fields, reason = apply_negation(slot.domain, fields)
+                 if fields is None:
+-                    drop(node, reason)
++                    drop(slot, reason)
+                     return None
+-            payload = {DOMAIN_FIELD[node.domain]: DOMAIN_MODEL[node.domain].model_validate(fields)}
+-            return LeafNode(
+-                type="leaf",
+-                **payload,
+-                source_concept=node.concept,
+-                line_ids=list(node.line_ids),
+-                lookup_ids=list(fill.lookup_ids),
+-            )
++            leaves.append(leaf(slot, fields, fill.lookup_ids))
++        if len(leaves) == 1:
++            return leaves[0]
++        # Several registry entries state the words: any of them satisfies the slot; an excluded
++        # slot excludes each of them.
++        return GroupNode(type="and" if slot.negated else "or", items=leaves)
++
++    def build(node: LogicGroup | Slot) -> GroupNode | LeafNode | None:
++        if isinstance(node, Slot):
++            return build_slot(node)
+         children = [build(child) for child in node.items]
+         if node.type == "or" and any(child is None for child in children):
+-            # One alternative cannot be stated: the whole choice stays as text.
+-            for _, slot in iter_slots(node):
+-                if not any(item["slot_id"] == slot.slot_id for item in dropped):
+-                    drop(slot, "another alternative of the same choice cannot be encoded")
+-            return None
++            excluded_combination = any(isinstance(child, Slot) and child.negated for child in node.items)
++            if excluded_combination or all(child is None for child in children):
++                reason = (
++                    "another part of the same excluded combination cannot be encoded"
++                    if excluded_combination
++                    else "no alternative of this choice can be encoded"
++                )
++                for _, slot in iter_slots(node):
++                    drop(slot, reason)
++                return None
++            # Alternatives CTML can hold are kept; the others stay as text (C26).
++            for logic, child in zip(node.items, children, strict=True):
++                if child is None:
++                    for _, slot in iter_slots(logic):
++                        drop(slot, "this alternative cannot be encoded")
++                        for item in dropped:
++                            if item["slot_id"] == slot.slot_id:
++                                item["alternative"] = True
+         kept = [child for child in children if child is not None]
+         if not kept:
+             return None
++        if len(kept) == 1 and isinstance(kept[0], GroupNode) and kept[0].type == node.type:
++            return kept[0]
+         return GroupNode(type=node.type, items=kept)
+ 
+     tree = build(structure.logic) if structure.logic is not None else None
+diff --git a/app/services/ctml/qa.py b/app/services/ctml/qa.py
+index a66f76d..3cdfe20 100644
+--- a/app/services/ctml/qa.py
++++ b/app/services/ctml/qa.py
+@@ -2,7 +2,8 @@
+ 
+ The status is always "needs_review": a candidate is never approved by code. "blocked" means
+ the CTML has defects that must be fixed before review (schema or policy errors, criteria
+-without an encoding, arms without a match tree, missing required metadata).
++without an encoding, arms without a match tree or with a contradictory one, missing required
++metadata).
+ """
+ 
+ from __future__ import annotations
+@@ -57,6 +58,7 @@ SHELLS = {
+ BLOCKING_PREFIXES = (
+     "criterion_not_encoded:",
+     "arm_without_match:",
++    "arm_contradiction:",
+     "metadata_missing:",
+     "scope_without_arm:",
+     "design_not_accepted",
+diff --git a/app/services/ctml/text.py b/app/services/ctml/text.py
+index 26affb0..4d56350 100644
+--- a/app/services/ctml/text.py
++++ b/app/services/ctml/text.py
+@@ -130,8 +130,9 @@ def clean_line(text: str) -> str:
+ 
+ 
+ def comparison_key(text: str) -> str:
+-    """Case-folded key with unified quotes, dashes and spaces, for substring checks."""
+-    folded = str(text).translate(_QUOTES).casefold()
++    """Case-folded key with unified quotes, dashes and spaces, for substring checks. Table cell
++    separators ("|") count as spaces, so words that run across cells of one row can be quoted."""
++    folded = str(text).translate(_QUOTES).casefold().replace("|", " ")
+     folded = re.sub(r"\s*-\s*\n?\s*", "-", folded)
+     return " ".join(folded.split())
+ 
+diff --git a/app/services/ctml/workflow.py b/app/services/ctml/workflow.py
+index f8e4025..34ca1e0 100644
+--- a/app/services/ctml/workflow.py
++++ b/app/services/ctml/workflow.py
+@@ -28,6 +28,7 @@ talk to the model at once (PMATCH_MAX_PARALLEL_AGENTS).
+ from __future__ import annotations
+ 
+ import asyncio
++import json
+ import logging
+ import re
+ import time
+@@ -62,7 +63,7 @@ from app.services.ctml.contracts import (
+     ResolverSubmission,
+ )
+ from app.services.ctml.document.inventory import Criterion
+-from app.services.ctml.matching import leaf_payload
++from app.services.ctml.matching import compile_tree, leaf_payload
+ from app.services.ctml.merge import coverage_omissions, merge_criterion, render_logic, slots_of
+ from app.services.ctml.metadata_rules import resolve_metadata
+ from app.services.ctml.outcomes import (
+@@ -244,19 +245,70 @@ def arms_text(design: LoopOutcome | None) -> str:
+     return "\n".join(lines)
+ 
+ 
++def describe_condition(payload: dict) -> str:
++    """One CTML condition in words: what an eligible patient has, or must not have (NOT)."""
++    kind = next(iter(payload), "")
++    fields = payload.get(kind, {})
++
++    def plain(value) -> str:
++        return str(value).lstrip("!")
++
++    def negated(*names: str) -> bool:
++        return any(str(fields.get(name, "")).startswith("!") for name in names)
++
++    if kind == "clinical":
++        parts = []
++        if fields.get("oncotree_primary_diagnosis"):
++            parts.append(f"diagnosis {plain(fields['oncotree_primary_diagnosis'])}")
++        for name, label in (("her2_status", "HER2"), ("er_status", "ER"), ("pr_status", "PR")):
++            if fields.get(name):
++                parts.append(f"{label} {fields[name]}")
++        if fields.get("age_expression"):
++            parts.append(f"age {fields['age_expression']}")
++        sign = "NOT " if negated("oncotree_primary_diagnosis") else ""
++        return sign + ", ".join(parts)
++    if kind == "genomic":
++        detail = [
++            str(fields[name])
++            for name in ("protein_change", "wildcard_protein_change", "fusion_partner_hugo_symbol")
++            if fields.get(name)
++        ]
++        if fields.get("cnv_call"):
++            detail.append(plain(fields["cnv_call"]))
++        sign = "NOT " if negated("variant_category", "cnv_call", "hugo_symbol") else ""
++        text = f"{plain(fields.get('hugo_symbol', '?'))} {plain(fields.get('variant_category', ''))}"
++        return sign + text + (f" ({', '.join(detail)})" if detail else "")
++    if kind == "prior_treatment":
++        named = [
++            plain(fields[name]) for name in ("agent_class", "agent", "transplant_type") if fields.get(name)
++        ]
++        sign = "NOT " if negated("agent_class", "agent", "transplant_type") else ""
++        what = f"prior {fields.get('treatment_category', '?')}"
++        return sign + what + (f": {', '.join(named)}" if named else " (any)")
++    return json.dumps(payload)
++
++
++def render_match(node: dict, indent: int = 0) -> str:
++    """A compiled CTML rule in words (ALL of / ANY of / conditions)."""
++    pad = "  " * indent
++    for key, label in (("and", "ALL of:"), ("or", "ANY of:")):
++        if key in node:
++            return "\n".join([pad + label, *(render_match(child, indent + 1) for child in node[key])])
++    return f"{pad}- {describe_condition(node)}"
++
++
+ def render_tree(node: GroupNode | LeafNode | None, indent: int = 0) -> str:
+-    """An encoding as readable lines: each condition with the words and lines it encodes."""
++    """An encoding in words: each condition with the protocol words and lines it encodes."""
+     pad = "  " * indent
+     if node is None:
+         return f"{pad}(no rule)"
+     if isinstance(node, LeafNode):
+         payload = leaf_payload(node) if node.kind() else {}
+-        kind = next(iter(payload), "?")
+-        values = ", ".join(f"{name} = {value}" for name, value in payload.get(kind, {}).items())
+-        return f'{pad}{kind}: {values}  <- "{node.source_concept}" ({", ".join(node.line_ids)})'
+-    lines = [f"{pad}{node.type.upper()}"]
+-    lines.extend(render_tree(child, indent + 1) for child in node.items)
+-    return "\n".join(lines)
++        return (
++            f'{pad}- {describe_condition(payload)}  <- "{node.source_concept}" ({", ".join(node.line_ids)})'
++        )
++    label = "ALL of:" if node.type == "and" else "ANY of:"
++    return "\n".join([pad + label, *(render_tree(child, indent + 1) for child in node.items)])
+ 
+ 
+ def render_encoding(result: CriterionResult | None) -> str:
+@@ -300,11 +352,22 @@ def resolver_note(issues: list[ResolverIssue], earlier: CriterionResult | None)
+     )
+ 
+ 
++READING_GUIDE = (
++    "How to read the rules: an arm matches a patient who meets ALL of the rules of the criteria that apply "
++    "to the arm. 'NOT X' means the patient must not have X (an exclusion). 'ANY of' lists alternatives. "
++    "Text kept for a criterion is not matched automatically: a reviewer reads it."
++)
++
++
+ def candidate_view(
+-    fields: dict, design: DesignSubmission, results: list[CriterionResult], placements: dict
++    fields: dict,
++    design: DesignSubmission,
++    results: list[CriterionResult],
++    placements: dict,
++    arm_rules: dict[str, list] | None = None,
+ ) -> str:
+-    """What the resolver audits: trial details, arms and every criterion with its encoding."""
+-    parts = ["# CTML candidate", "", "## Trial details"]
++    """What the resolver audits: trial details, arms with their rules, and every criterion."""
++    parts = ["# CTML candidate", "", READING_GUIDE, "", "## Trial details"]
+     for key in (
+         "trial_id",
+         "long_title",
+@@ -326,6 +389,10 @@ def candidate_view(
+             parts.append(
+                 f"  - dose level {level.level_code}: {level.level_description} ({', '.join(level.line_ids)})"
+             )
++        if arm_rules is not None:
++            match = arm_rules.get(arm.arm_code) or []
++            parts.append("  Rule of this arm:")
++            parts.append(render_match(match[0], 2) if match else "    (no rule)")
+     parts += [
+         "",
+         "## Criteria",
+@@ -604,13 +671,36 @@ class Supervisor(Executor):
+             review += [f"agent_note:{cid}/{role}: {note[:200]}" for note in outcome.accepted.review_notes]
+         merged = merge_criterion(track.used, fills)
+         for item in merged.dropped:
+-            review.append(
+-                f'slot_not_encoded:{cid}:{item["slot_id"]}: "{item["concept"][:100]}" kept as text '
+-                f"({item['reason'][:150]})"
+-            )
++            if item.get("alternative"):
++                review.append(
++                    f'or_alternative_not_encoded:{cid}:{item["slot_id"]}: "{item["concept"][:100]}" stays as '
++                    "text; patients who qualify only through it are not matched automatically "
++                    f"({item['reason'][:120]})"
++                )
++            else:
++                review.append(
++                    f'slot_not_encoded:{cid}:{item["slot_id"]}: "{item["concept"][:100]}" kept as text '
++                    f"({item['reason'][:150]})"
++                )
+         if track.resolver is not None:
+             problems = " | ".join(issue["problem"][:200] for issue in track.resolver["issues"])
+-            review.append(f"resolver_repaired:{cid}: encoded again after the resolver reported: {problems}")
++            earlier = track.resolver["earlier"]
++            same = (
++                earlier is not None
++                and earlier.submission is not None
++                and earlier.submission.representable == merged.submission.representable
++                and earlier.compiled
++                == (compile_tree(merged.submission.tree) if merged.submission.tree else None)
++            )
++            if same:
++                review.append(
++                    f"resolver_finding_not_adopted:{cid}: the agents kept the encoding after checking: "
++                    + problems
++                )
++            else:
++                review.append(
++                    f"resolver_repaired:{cid}: encoded again after the resolver reported: {problems}"
++                )
+         track.result = CriterionResult(
+             criterion=track.criterion,
+             status="accepted",
+@@ -633,7 +723,7 @@ class Supervisor(Executor):
+             for c in self.plan.criteria
+         ]
+         design = self.trial["design"].accepted
+-        _, evidence, _ = compile_ctml(
++        ctml, evidence, _ = compile_ctml(
+             fields,
+             design,
+             results,
+@@ -642,7 +732,8 @@ class Supervisor(Executor):
+             self.plan.context.oncotree,
+         )
+         placements = {entry["criterion_id"]: entry["text_placement"] for entry in evidence["criteria"]}
+-        return candidate_view(fields, design, results, placements), set(self.tracks)
++        arm_rules = {arm["arm_code"]: arm["match"] for arm in ctml["treatment_list"]["step"][0]["arm"]}
++        return candidate_view(fields, design, results, placements, arm_rules), set(self.tracks)
+ 
+     def _route_resolver(self, outbox: dict[str, list[Job]]) -> None:
+         outcome = self.trial["resolver"]
+diff --git a/app/tests/ctml/test_v5_units.py b/app/tests/ctml/test_v5_units.py
+index 413443c..41961be 100644
+--- a/app/tests/ctml/test_v5_units.py
++++ b/app/tests/ctml/test_v5_units.py
+@@ -49,13 +49,19 @@ def structure(logic: dict | None, representable: str = "full", examples=(), unma
+     )
+ 
+ 
++def mapped(model, slot_id: str, field: str, *values: dict):
++    return model.model_validate({"slot_id": slot_id, "status": "mapped", field: list(values)})
++
++
+ def therapy(slot_id: str, **fields) -> PriorTreatmentFill:
+-    return PriorTreatmentFill.model_validate(
+-        {
+-            "slot_id": slot_id,
+-            "status": "mapped",
+-            "prior_treatment": {"treatment_category": "Medical Therapy", **fields},
+-        }
++    return mapped(
++        PriorTreatmentFill, slot_id, "prior_treatment", {"treatment_category": "Medical Therapy", **fields}
++    )
++
++
++def diagnosis(slot_id: str, *names: str) -> ClinicalFill:
++    return mapped(
++        ClinicalFill, slot_id, "clinical", *({"oncotree_primary_diagnosis": name} for name in names)
+     )
+ 
+ 
+@@ -81,25 +87,88 @@ def test_an_and_keeps_the_conditions_that_can_be_encoded():
+     assert [item.quote for item in merged.submission.unmapped_items] == ["drug B"]
+ 
+ 
+-def test_an_or_with_an_alternative_that_cannot_be_encoded_stays_text():
+-    choice = {
++def test_an_or_keeps_the_alternatives_that_can_be_encoded():
++    """C26 (UHN convention): the alternatives CTML can hold are kept; the others stay as text."""
++    cohorts = {
+         "type": "or",
+-        "items": [slot("S2", "prior_treatment", "drug B"), slot("S3", "prior_treatment", "drug C")],
++        "items": [
++            slot("S1", "clinical", "disease A"),
++            {
++                "type": "and",
++                "items": [slot("S2", "clinical", "disease B"), slot("S3", "genomic", "marker C")],
++            },
++            slot("S4", "clinical", "tumor with marker D of any histology"),
++        ],
+     }
+-    logic = {"type": "and", "items": [slot("S1", "clinical", "melanoma"), choice]}
+     fills = {
+-        "S1": ClinicalFill.model_validate(
+-            {"slot_id": "S1", "status": "mapped", "clinical": {"oncotree_primary_diagnosis": "Melanoma"}}
++        "S1": diagnosis("S1", "Disease A"),
++        "S2": diagnosis("S2", "Disease B"),
++        "S3": mapped(GenomicFill, "S3", "genomic", {"hugo_symbol": "GENE3", "variant_category": "Mutation"}),
++        "S4": cannot("S4", ClinicalFill),
++    }
++    merged = merge_criterion(structure(cohorts), fills)
++    assert compile_tree(merged.submission.tree) == {
++        "or": [
++            {"clinical": {"oncotree_primary_diagnosis": "Disease A"}},
++            {
++                "and": [
++                    {"clinical": {"oncotree_primary_diagnosis": "Disease B"}},
++                    {"genomic": {"hugo_symbol": "GENE3", "variant_category": "Mutation"}},
++                ]
++            },
++        ]
++    }
++    assert merged.submission.representable == "partial"
++    assert [(item["slot_id"], item["alternative"]) for item in merged.dropped] == [("S4", True)]
++    assert "tumor with marker D of any histology" in [item.quote for item in merged.submission.unmapped_items]
++
++
++def test_an_excluded_combination_is_never_split():
++    """NOT (X with Y): dropping Y would exclude every patient with X, more than the protocol does."""
++    combination = {
++        "type": "or",
++        "items": [
++            slot("S1", "prior_treatment", "drug A", negated=True),
++            slot("S2", "prior_treatment", "with a severe reaction", negated=True),
++        ],
++    }
++    merged = merge_criterion(
++        structure(combination), {"S1": therapy("S1", agent="Drug A"), "S2": cannot("S2")}
++    )
++    assert merged.submission.tree is None and merged.submission.representable == "none"
++    assert {item["slot_id"] for item in merged.dropped} == {"S1", "S2"}
++    assert not any(item["alternative"] for item in merged.dropped)
++
++
++def test_a_slot_can_carry_several_registry_values():
++    """Words no single registry entry covers: any value satisfies the slot; NOT excludes each."""
++    sites = slot("S1", "clinical", "carcinoma of organ A or organ B")
++    targets = slot("S2", "prior_treatment", "an inhibitor of X or Y", negated=True)
++    logic = {"type": "and", "items": [sites, targets]}
++    fills = {
++        "S1": diagnosis("S1", "Carcinoma A", "Carcinoma B"),
++        "S2": mapped(
++            PriorTreatmentFill,
++            "S2",
++            "prior_treatment",
++            {"treatment_category": "Medical Therapy", "agent_class": "X Inhibitor"},
++            {"treatment_category": "Medical Therapy", "agent_class": "Y Inhibitor"},
+         ),
+-        "S2": therapy("S2", agent="Drug B"),
+-        "S3": cannot("S3"),
+     }
+     merged = merge_criterion(structure(logic), fills)
+-    # Encoding drug B alone would exclude the patients who qualify through drug C.
+-    assert compile_tree(merged.submission.tree) == {"clinical": {"oncotree_primary_diagnosis": "Melanoma"}}
+-    assert {item["slot_id"] for item in merged.dropped} == {"S2", "S3"}
+-    alone = merge_criterion(structure(choice), {"S2": therapy("S2", agent="Drug B"), "S3": cannot("S3")})
+-    assert alone.submission.tree is None and alone.submission.representable == "none"
++    assert merged.dropped == []
++    assert compile_tree(merged.submission.tree) == {
++        "and": [
++            {
++                "or": [
++                    {"clinical": {"oncotree_primary_diagnosis": "Carcinoma A"}},
++                    {"clinical": {"oncotree_primary_diagnosis": "Carcinoma B"}},
++                ]
++            },
++            {"prior_treatment": {"treatment_category": "Medical Therapy", "agent_class": "!X Inhibitor"}},
++            {"prior_treatment": {"treatment_category": "Medical Therapy", "agent_class": "!Y Inhibitor"}},
++        ]
++    }
+ 
+ 
+ def test_negation_comes_from_the_structure():
+@@ -115,36 +184,19 @@ def test_negation_comes_from_the_structure():
+     }
+     fills = {
+         "S1": therapy("S1", agent_class="Class A"),
+-        "S2": ClinicalFill.model_validate(
+-            {"slot_id": "S2", "status": "mapped", "clinical": {"age_expression": "<18"}}
++        "S2": mapped(ClinicalFill, "S2", "clinical", {"age_expression": "<18"}),
++        "S3": mapped(GenomicFill, "S3", "genomic", {"hugo_symbol": "GENE1", "variant_category": "Mutation"}),
++        "S4": mapped(
++            GenomicFill,
++            "S4",
++            "genomic",
++            {"hugo_symbol": "GENE2", "variant_category": "CNV", "cnv_call": "High level amplification"},
+         ),
+-        "S3": GenomicFill.model_validate(
+-            {
+-                "slot_id": "S3",
+-                "status": "mapped",
+-                "genomic": {"hugo_symbol": "GENE1", "variant_category": "Mutation"},
+-            }
+-        ),
+-        "S4": GenomicFill.model_validate(
+-            {
+-                "slot_id": "S4",
+-                "status": "mapped",
+-                "genomic": {
+-                    "hugo_symbol": "GENE2",
+-                    "variant_category": "CNV",
+-                    "cnv_call": "High level amplification",
+-                },
+-            }
+-        ),
+-        "S5": PriorTreatmentFill.model_validate(
+-            {
+-                "slot_id": "S5",
+-                "status": "mapped",
+-                "prior_treatment": {
+-                    "treatment_category": "Stem Cell Transplant",
+-                    "transplant_type": "Allogeneic",
+-                },
+-            }
++        "S5": mapped(
++            PriorTreatmentFill,
++            "S5",
++            "prior_treatment",
++            {"treatment_category": "Stem Cell Transplant", "transplant_type": "Allogeneic"},
+         ),
+     }
+     merged = merge_criterion(structure(logic), fills)
+@@ -181,23 +233,11 @@ def test_conditions_ctml_cannot_exclude_are_kept_as_text():
+         ],
+     }
+     fills = {
+-        "S1": ClinicalFill.model_validate(
+-            {"slot_id": "S1", "status": "mapped", "clinical": {"oncotree_primary_diagnosis": "_SOLID_"}}
+-        ),
+-        "S2": GenomicFill.model_validate(
+-            {
+-                "slot_id": "S2",
+-                "status": "mapped",
+-                "genomic": {"hugo_symbol": "GENE1", "variant_category": "Structural Variation"},
+-            }
+-        ),
+-        "S3": PriorTreatmentFill.model_validate(
+-            {
+-                "slot_id": "S3",
+-                "status": "mapped",
+-                "prior_treatment": {"treatment_category": "Medical Therapy"},
+-            }
++        "S1": diagnosis("S1", "_SOLID_"),
++        "S2": mapped(
++            GenomicFill, "S2", "genomic", {"hugo_symbol": "GENE1", "variant_category": "Structural Variation"}
+         ),
++        "S3": mapped(PriorTreatmentFill, "S3", "prior_treatment", {"treatment_category": "Medical Therapy"}),
+     }
+     merged = merge_criterion(structure(logic), fills)
+     assert merged.submission.tree is None and merged.submission.representable == "none"
+@@ -347,9 +387,9 @@ def test_fills_give_positive_values_from_the_agents_own_lookups(context):
+     logic = slot("S1", "prior_treatment", "anti-PD-1 antibody", line, negated=True)
+     own = lookup(context, "EXC-1/prior_therapy", [CLASS_CANDIDATE])
+     value = {"treatment_category": "Medical Therapy", "agent_class": "Class A"}
+-    fill = {"slot_id": "S1", "status": "mapped", "prior_treatment": value, "lookup_ids": [own]}
++    fill = {"slot_id": "S1", "status": "mapped", "prior_treatment": [value], "lookup_ids": [own]}
+     assert run_fills(context, "EXC-1", logic, [fill]) == set()
+-    negated = {**fill, "prior_treatment": {**value, "agent_class": "!Class A"}}
++    negated = {**fill, "prior_treatment": [{**value, "agent_class": "!Class A"}]}
+     assert "negation_in_value" in run_fills(context, "EXC-1", logic, [negated])
+     other = lookup(context, "EXC-1/eligibility", [CLASS_CANDIDATE])
+     assert "unknown_lookup_id" in run_fills(context, "EXC-1", logic, [{**fill, "lookup_ids": [other]}])
+@@ -367,9 +407,28 @@ def test_every_slot_needs_one_fill_and_a_reason_to_stay_unmapped(context):
+     category_only = {
+         "slot_id": "S1",
+         "status": "mapped",
+-        "prior_treatment": {"treatment_category": "Medical Therapy"},
++        "prior_treatment": [{"treatment_category": "Medical Therapy"}],
+     }
+     assert "cannot_exclude" in run_fills(context, "EXC-1", logic, [category_only])
++    assert "mapped_without_value" in run_fills(
++        context, "EXC-1", logic, [{"slot_id": "S1", "status": "mapped", "prior_treatment": []}]
++    )
++
++
++def test_every_value_of_a_fill_is_checked(context):
++    line = line_of(context, "EXC-1")
++    logic = slot("S1", "prior_treatment", "anti-PD-1 antibody", line, negated=True)
++    own = lookup(context, "EXC-1/prior_therapy", [CLASS_CANDIDATE, {"name": "Class B", "kind": "class"}])
++    values = [
++        {"treatment_category": "Medical Therapy", "agent_class": "Class A"},
++        {"treatment_category": "Medical Therapy", "agent_class": "Class B"},
++    ]
++    fill = {"slot_id": "S1", "status": "mapped", "prior_treatment": values, "lookup_ids": [own]}
++    assert run_fills(context, "EXC-1", logic, [fill]) == set()
++    invented = [*values, {"treatment_category": "Medical Therapy", "agent_class": "Class Z"}]
++    assert "value_not_from_lookup" in run_fills(
++        context, "EXC-1", logic, [{**fill, "prior_treatment": invented}]
++    )
+ 
+ 
+ # --- coverage and resolver checks -----------------------------------------------------------
+@@ -412,3 +471,71 @@ def test_layout_settings_from_the_environment(monkeypatch):
+     monkeypatch.setenv("PMATCH_MAX_REPAIR_ROUNDS", "2")
+     settings = Settings.from_env()
+     assert (settings.agent_layout, settings.resolver, settings.max_repair_rounds) == ("compact", False, 2)
++
++
++def test_quotes_can_run_across_table_cells():
++    from app.services.ctml.text import contains_phrase
++
++    assert contains_phrase(
++        "Absolute neutrophil count (ANC) | ≥1.5 X 109/L", "Absolute neutrophil count (ANC) ≥1.5"
++    )
++
++
++def test_a_dose_escalation_level_states_its_starting_dose_only():
++    from app.services.ctml.checks.design import doses_beside_starting_dose
++
++    assert doses_beside_starting_dose("50 mg (starting dose)/100/150 mg PO QD")
++    assert doses_beside_starting_dose("12.5 mg PO QD (starting dose); 300 mg PO QD (sub-study)")
++    assert not doses_beside_starting_dose("25 mg (starting dose) PO BID, Days 1-21 of each 21-day cycle")
++    assert not doses_beside_starting_dose("100/200/300 mg PO QD")
++
++
++def test_rules_are_described_in_words_for_the_resolver():
++    from app.services.ctml.workflow import render_match
++
++    rule = {
++        "and": [
++            {"clinical": {"age_expression": ">=18"}},
++            {
++                "prior_treatment": {
++                    "treatment_category": "Stem Cell Transplant",
++                    "transplant_type": "!Allogeneic",
++                }
++            },
++            {"or": [{"clinical": {"oncotree_primary_diagnosis": "Disease A", "her2_status": "Negative"}}]},
++            {"genomic": {"hugo_symbol": "GENE1", "variant_category": "!Mutation"}},
++        ]
++    }
++    text = render_match(rule)
++    assert "ALL of:" in text and "ANY of:" in text
++    assert "- NOT prior Stem Cell Transplant: Allogeneic" in text
++    assert "- diagnosis Disease A, HER2 Negative" in text
++    assert "- NOT GENE1 Mutation" in text and "- age >=18" in text
++
++
++def test_an_arm_without_a_diagnosis_is_listed_for_review():
++    from app.services.ctml.compiler import names_diagnosis
++
++    assert not names_diagnosis({"and": [{"clinical": {"age_expression": ">=18"}}]})
++    assert not names_diagnosis({"and": [{"clinical": {"oncotree_primary_diagnosis": "!Disease A"}}]})
++    assert names_diagnosis({"and": [{"or": [{"clinical": {"oncotree_primary_diagnosis": "_SOLID_"}}]}]})
++
++
++def test_an_arm_that_requires_and_excludes_the_same_diagnosis_is_blocked():
++    from app.services.ctml.compiler import contradictions
++    from app.services.ctml.registries.oncotree import OncoTreeIndex
++    from app.tests.ctml.synthetic import ONCOTREE_NODES
++
++    oncotree = OncoTreeIndex.from_nodes(ONCOTREE_NODES)
++    required = {"clinical": {"oncotree_primary_diagnosis": "Melanoma"}}
++    parent_excluded = {"clinical": {"oncotree_primary_diagnosis": "!Skin"}}
++    assert contradictions([required, parent_excluded], oncotree) == [("Skin", "Melanoma")]
++    other_excluded = {"clinical": {"oncotree_primary_diagnosis": "!Non-Small Cell Lung Cancer"}}
++    assert contradictions([required, other_excluded], oncotree) == []
++    either = {
++        "or": [
++            {"clinical": {"oncotree_primary_diagnosis": "Melanoma"}},
++            {"clinical": {"oncotree_primary_diagnosis": "Non-Small Cell Lung Cancer"}},
++        ]
++    }
++    assert contradictions([either, parent_excluded], oncotree) == []
+diff --git a/app/tests/ctml/test_workflow_offline.py b/app/tests/ctml/test_workflow_offline.py
+index 6460b92..9730ebc 100644
+--- a/app/tests/ctml/test_workflow_offline.py
++++ b/app/tests/ctml/test_workflow_offline.py
+@@ -135,7 +135,7 @@ def clinical_step(first: str, results: list[str], turn: int):
+             criterion_id
+         ]
+         lookups = []
+-    fill = {"slot_id": "S1", "status": "mapped", "clinical": value, "lookup_ids": lookups}
++    fill = {"slot_id": "S1", "status": "mapped", "clinical": [value], "lookup_ids": lookups}
+     return [("submit_clinical", {"submission": {"fills": [fill]}})]
+ 
+ 
+@@ -152,14 +152,14 @@ def prior_therapy_step(first: str, results: list[str], turn: int):
+         fill = {
+             "slot_id": "S1",
+             "status": "mapped",
+-            "prior_treatment": value,
++            "prior_treatment": [value],
+             "lookup_ids": [last_lookup_id(results)],
+         }
+     else:
+         if turn > 0:
+             return "done"
+         value = {"treatment_category": "Stem Cell Transplant", "transplant_type": "Allogeneic"}
+-        fill = {"slot_id": "S1", "status": "mapped", "prior_treatment": value}
++        fill = {"slot_id": "S1", "status": "mapped", "prior_treatment": [value]}
+     return [("submit_prior_therapy", {"submission": {"fills": [fill]}})]
+ 
+ 
+@@ -288,7 +288,9 @@ async def test_v5_workflow_end_to_end(workspace):
+     assert [(i["target"], i["routed_to"]) for i in issues] == [("EXC-3", "review"), ("INC-1", "repair")]
+     review = result.qa["review_items"]
+     assert any(item.startswith("resolver:EXC-3:") for item in review)
+-    assert any(item.startswith("resolver_repaired:INC-1:") for item in review)
++    # The agents checked the finding and gave the same encoding: listed as not adopted.
++    assert any(item.startswith("resolver_finding_not_adopted:INC-1:") for item in review)
++    assert not any(item.startswith("resolver_repaired:") for item in review)
+     assert evidence["workflow"]["timeline"][-1]["event"] == "finished"
+ 
+     calls = calls_of(run_dir)
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index f38b6b7..1bceb1d 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -177,21 +177,23 @@ The table above is the compact layout. The v5 layout replaces the criterion agen
+ | Agent | First message | Tools | Submits |
+ |---|---|---|---|
+ | Eligibility logic | The criterion (as for the compact criterion agent), the arms with their population labels, and a repair note when the supervisor sends the criterion back | document tools, `read_context`; no registry search | `EligibilitySubmission`: representable, logic (AND / OR groups of slots), unmapped items, context category, examples |
+-| Clinical, genomics, prior therapy | The criterion, the structure and the slots of the agent's domain, and a repair note when there is one | document tools, `read_context`, and only the agent's own search (`search_diagnosis`, `search_gene` or `search_therapy`) | One fill per slot: the positive registry value with its lookup IDs, or `cannot_map` with the reason |
++| Clinical, genomics, prior therapy | The criterion, the structure and the slots of the agent's domain, and a repair note when there is one | document tools, `read_context`, and only the agent's own search (`search_diagnosis`, `search_gene` or `search_therapy`) | One fill per slot: the positive registry values with their lookup IDs (one value, or several when no single registry entry covers the words), or `cannot_map` with the reason |
+ | Coverage checker | The criterion and the tables it refers to; never the structure | none besides `submit_coverage` | Every condition with its exact words and kind: requirement, exception, example or note |
+-| Resolver | The compiled candidate: trial details, arms with dose levels and population labels, every criterion with its text, rule, text items and placement | document tools | Issues: target (criterion ID, `design` or `metadata`), action (`repair` or `review`), problem, quotes, line IDs |
++| Resolver | The compiled candidate in words: a reading guide, trial details, arms with dose levels, population labels and the arm's combined rule, every criterion with its text, rule, text items and placement | document tools | Issues: target (criterion ID, `design` or `metadata`), action (`repair` or `review`), problem, quotes, line IDs |
+ 
+ **Slots and polarity.** A slot is one condition CTML can hold: slot ID, domain (`clinical`, `genomic` or `prior_treatment`), the exact words, line IDs and `negated`. Polarity belongs to the structure. The domain agents give positive values, and a value with "!" is rejected (`negation_in_value`). Code writes the exclusion (`merge.apply_negation`): "!" before a diagnosis, drug, drug class or transplant type; the opposite age rule (`<18` for an excluded `>=18`); `!Mutation`; a negated copy-number call. A negated condition the schema cannot state (a treatment category alone, a structural variant, `_SOLID_` or `_LIQUID_`) is refused at the fill (`cannot_exclude`) and stays as text.
+ 
++**Several values.** A fill normally has one value. Words that no single registry entry covers (a cancer of several organs, an inhibitor of two targets) get several values: any of them satisfies the slot (an OR), and a negated slot excludes each of them (an AND of exclusions). One disease named in several sites ("colon or rectum") is one slot, and the clinical agent prefers the one node that covers it. Every value is checked as its own leaf.
++
+ **Examples.** The eligibility logic agent describes example patients by the slots they have. Code evaluates them on the logic (`merge.evaluate_logic`) and rejects a structure that disagrees with its own examples. This replaces `test_tree` of the compact layout.
+ 
+ **Checks.** `checks/eligibility.py` holds the structure, quote, sub-item coverage, polarity and exception checks of the compact layout. `checks/slots.py` checks each fill as the leaf it becomes, with the compact registry checks: a value must come from a search of the same agent (`lookup_ids` owned by `<ID>/<agent>`), copied exactly, of the right kind. `checks/coverage.py` and `checks/resolver.py` require exact quotes.
+ 
+-**Merge.** Code joins the fills into the structure by slot ID (`merge.merge_criterion`). A slot without a value (`cannot_map`, or a domain agent that did not finish) is never guessed: it becomes an unmapped item and the encoding becomes partial, with a review item (`slot_not_encoded:`). Inside an AND the other conditions stay: the rule then admits more patients, never fewer. Inside an OR the whole choice goes to text, because encoding only some alternatives would exclude the patients who qualify through another one (C26).
++**Merge.** Code joins the fills into the structure by slot ID (`merge.merge_criterion`). A slot without a value (`cannot_map`, or a domain agent that did not finish) is never guessed: it becomes an unmapped item and the encoding becomes partial, with a review item (`slot_not_encoded:`). Inside an AND the other conditions stay: the rule then admits more patients, never fewer. Inside an OR the alternatives CTML can hold stay and the others go to text, with a review item (`or_alternative_not_encoded:`), as in the UHN gold files (C26, revised 10/06). An OR of excluded conditions (an excluded combination) is never split: dropping one part would exclude more patients than the protocol does, so it goes to text. QA lists an arm whose rule requires no diagnosis (`arm_without_diagnosis:`), and blocks an arm that requires a diagnosis and excludes a diagnosis covering it (`arm_contradiction:`), because no patient can match it.
+ 
+ **Coverage comparison.** A requirement or exception of the coverage listing is covered when at least half of its characters fall inside a slot's words or an unmapped item. Omissions send the criterion back to the eligibility logic agent once (`PMATCH_MAX_REPAIR_ROUNDS`, default 1). An omission still there after the repair is listed for review (`coverage_omission:`); the structure is not changed.
+ 
+-**Resolver.** Every finding must quote its cited lines. A `repair` finding on a criterion sends that criterion back once (at most 10 criteria): the eligibility logic and domain agents run again with the finding as a note, and the new encoding is listed for review (`resolver_repaired:`). If the repair is not accepted, the earlier encoding is kept (`resolver_repair_not_accepted:`). Findings on the design or the metadata, and `review` findings, go to the review list (`resolver:`). `PMATCH_RESOLVER=0` turns the resolver off.
++**Resolver.** Every finding must quote its cited lines. A `repair` finding on a criterion sends that criterion back once (at most 10 criteria): the eligibility logic and domain agents run again with the finding as a note. A changed encoding is listed for review (`resolver_repaired:`); an unchanged one as `resolver_finding_not_adopted:`. If the repair is not accepted, the earlier encoding is kept (`resolver_repair_not_accepted:`). Findings on the design or the metadata, and `review` findings, go to the review list (`resolver:`). `PMATCH_RESOLVER=0` turns the resolver off.
+ 
+ **Files.** `agents/metadata.json`, `agents/design.json`, `agents/coverage/<ID>.json`, `agents/eligibility/<ID>.json`, `agents/clinical|genomics|prior_therapy/<ID>.json`, `agents/resolver.json` and `agents/resolver_view.md`. A repeated run of a criterion is saved as `<ID>.attempt2.json`. `evidence.json` adds, per criterion, the structure, every eligibility logic run, the coverage listing, the omissions left, the fills and the slots kept as text (`workflow`); and for the run the timeline, the repairs and the resolver findings (`workflow`). `qa_report.md` has a section on the workflow.
+ 
+diff --git a/docs/DECISIONS.md b/docs/DECISIONS.md
+index 49f53c8..3df0a24 100644
+--- a/docs/DECISIONS.md
++++ b/docs/DECISIONS.md
+@@ -41,7 +41,7 @@ Where a gold file and the protocol disagree, the code follows the protocol, and
+ | C8 | `principal_investigator` is never taken from the registry | Reviewer; site-specific |
+ | C9 | One step. A randomized comparison with shared eligibility is one "Randomization Arm (A vs B): …" with placebo as a dose level. A study in parts has one arm per part. Within a part, separate arms only for a different regimen (other drugs, or another schedule such as continuous versus intermittent). Dose levels, formulations and disease cohorts of one regimen stay in one arm. An open-label extension or a crossover from placebo is not an arm. | Gold files (09/29: NCT02783300 three arms, NCT02972034 Arms A to D, NCT05059262 one arm); reviewer 09/26 |
+ | C10 | `arm_code`: part and arm labels, what distinguishes the arm, then the part's title with its drugs. `arm_description`: one or two sentences in the protocol's words: how the recommended dose is found (for example mTPI and RP2D), or what a randomized comparison compares and its ratio. No dose lists. | Reviewer 09/25 and 09/26 |
+-| C11 | Dose levels: one per drug; "<dose> (starting dose) <route> <schedule>"; several fixed dose levels together ("10/20/40 mg PO QD"); at most 160 characters. A dose the protocol redacts ("CCI") or does not state comes from the ClinicalTrials.gov record, cited as an `R` line, with a review item; without one, "dose not disclosed". | Gold files; reviewer 09/29 (NCT04590963 dose) |
++| C11 | Dose levels: one per drug; for dose escalation the starting dose only, "<dose> (starting dose) <route> <schedule>" (later levels, dose reductions and sub-study doses are not dose levels; check `starting_dose_with_other_levels`); several fixed doses assigned from the start together ("10/20/40 mg PO QD"); when an amendment changes the dose for new participants, the current dose; at most 160 characters. A dose the protocol redacts ("CCI") or does not state comes from the ClinicalTrials.gov record, cited as an `R` line, with a review item; without one, "dose not disclosed". | Gold files; reviewer 09/29 (NCT04590963 dose); 10/05 runs (escalation levels and dose reductions listed as levels) |
+ | C12 | A population-scoped criterion always appears in the text list of every arm it applies to | Reviewer 09/24 |
+ | C13 | Exclusion texts start with "Exclusion Criteria: " | Reviewer 09/24 |
+ | C14 | Trial-wide text leaves out consent, oral administration, laboratory values, contraception and pregnancy, investigator judgement and optional sub-studies. "Laboratory value" means a blood, urine or ECG measurement; body weight and similar measurements are not in it and stay as text. | Reviewer 09/25; reviewer 09/26 answer (see Q2) |
+@@ -56,7 +56,7 @@ Where a gold file and the protocol disagree, the code follows the protocol, and
+ | C23 | Registry names are copied exactly from the lookup. Gold typos ("EFGR", "Anitneoplastic", "PD-1 Inhibitor" beside "PD1 Inhibitor") are not reproduced. | Project rule 6 |
+ | C24 | When one PDF holds several protocol versions, the last version with eligibility criteria is used, and the choice is reported | Our default (see Q3) |
+ | C25 | In a required prior-therapy list, "±", "with or without" and "if indicated" items are further OR alternatives, and a comma before "or" separates the top-level alternatives: "A and B, or C, ± D or E" is (A AND B) OR C OR D OR E | Reviewer 09/26 answer to Q1; NCT02972034 gold |
+-| C26 | If one alternative of a requirement cannot be encoded, none is encoded: the requirement stays as text. A waiver granted case by case ("eligible if the sponsor agrees") is not an alternative: the requirement is encoded and the waiver stays as text. | Logic: an encoded branch would exclude the patients who qualify through the other one; NCT02972034 gold and reviewer 09/29 (Part 2 prior-therapy tree) |
++| C26 | Revised 10/06. In a list of alternatives (diseases, cohorts, prior therapies), the alternatives CTML can hold are encoded and an alternative it cannot hold stays as text, with a review item (`or_alternative_not_encoded`): patients who qualify only through it are not matched automatically. An excluded combination ("X with Y") is never split: when one part cannot be encoded, the exclusion stays as text. A waiver granted case by case ("eligible if the sponsor agrees") is not an alternative: the requirement is encoded and the waiver stays as text. | NCT02783300 gold (Part 2 and Part 3 cohort lists are encoded although one alternative, an HPV-positive tumor of any histology, cannot be); the 09/29 rule "encode none" left multi-cohort arms of the 10/05 runs without any disease rule; reviewer 09/29 (waivers) |
+ | C27 | Progression on, failure of or intolerance to a therapy means the patient received it: the therapy is encoded when every alternative requires it (for example "prior platinum failure" gives the NCIt platinum class); progression, timing and setting stay as text | NCT04590963 gold; logic |
+ | C28 | An exclusion with an exception that cannot be encoded ("unless …", "except …", "… is allowed") gets no negated leaf for the excepted item. A negated class is kept when the registry hierarchy keeps the allowed drugs out of it, and a case-by-case waiver does not count as an exception. | Reviewer 09/29 (`!Cetuximab`); logic |
+ | C29 | A condition implied by another condition of the same arm is removed by the compiler and listed in `evidence.json` | Reviewer 09/29 (redundant Medical Therapy); logic-preserving |
+@@ -70,10 +70,14 @@ Where a gold file and the protocol disagree, the code follows the protocol, and
+ |---|---|---|
+ | A1 | The default agent layout follows architecture v5: a supervisor workflow (Agent Framework) with the metadata, study design, eligibility logic, clinical, genomics, prior therapy, coverage and resolver agents. The compact layout (one criterion agent per criterion, 09/29) stays behind `PMATCH_AGENT_LAYOUT=compact`. | Team decision to follow v5; the compact layout departed from it (`claude/AGENTIC_DESIGN_2026-09-29.md`). Neither layout is proven better: both are to be measured on the same protocols. |
+ | A2 | Polarity belongs to the eligibility logic agent. Domain agents give positive values; code writes the "!" form, the opposite age rule, `!Mutation` or a negated copy-number call. | One owner for NOT; a domain agent cannot flip a criterion's meaning. |
+-| A3 | A slot without a registry value is never guessed. In an AND, the other conditions stay; an OR with such an alternative goes entirely to text. | C26: an encoded branch would exclude the patients who qualify through the other one. |
++| A3 | A slot without a registry value is never guessed. In an AND the other conditions stay; in an OR the other alternatives stay (C26); an excluded combination goes entirely to text. | C26 (revised 10/06). |
+ | A4 | The coverage checker lists the criterion's conditions without seeing the encoding. Omissions get one targeted repair; an omission that remains goes to review and the structure is not changed. | v5: a finding that repeats goes to a person. Changing the structure automatically would add text for criteria the agent judged complete. |
+ | A5 | The resolver audits the compiled candidate once. Its findings must quote the protocol. Repair findings send at most 10 criteria back once; design and metadata findings go to review only. | Bounded repair without a full rerun (v5). |
+ | A6 | No gold file and no term list reaches any agent, in either layout. | Rules 1 and 2 above. |
++| A7 | A slot can carry several registry values when no single entry covers its words (a cancer of several sites, an inhibitor of two targets): any of them satisfies the slot, and a negated slot excludes each of them. One disease named in several sites ("colon or rectum") is one slot, and the clinical agent prefers the node that covers it. | 10/05 runs: "mTCC" and "PD-1 or PD-L1 targeted therapy" could not be stated with one value, and "colon or rectum" was split into two narrower nodes. |
++| A8 | The resolver reads every rule in words (ALL of, ANY of, NOT) with each arm's combined rule, and knows the UHN conventions. A finding that the agents check and do not adopt is listed as `resolver_finding_not_adopted`, not as a repair. | 10/05 runs: every resolver repair request contradicted a UHN convention (±, allogeneic transplant) or misread "NOT", and none noticed arms without a disease rule. |
++| A9 | QA lists an arm whose rule requires no diagnosis (`arm_without_diagnosis`, review item, not blocking). | 10/05 runs: NCT02783300 Parts 2 and 3 had only an age rule. |
++| A10 | QA blocks an arm whose rule requires a diagnosis and excludes a diagnosis that covers it (`arm_contradiction`): no patient can match. | 10/05 runs: negated "head and neck cancer of any other location" slots could map to a parent of the required diagnosis. |
+ 
+ ## Differences from the gold files that are intended
+ 
+@@ -83,7 +87,7 @@ Each needs clinical confirmation (see the questions). The code follows the proto
+ - **Anti-VEGF.** NCT02972034 says "anti-vascular endothelial growth factor" (the ligand). The gold uses "Anti-VEGFR Monoclonal Antibody" (the receptor). The code takes the class that NCIt returns for the protocol's words (Q9).
+ - **Part 2 of NCT02783300.**
+   - The gold places lymphoma negations as OR siblings of Non-Hodgkin Lymphoma, which admits almost every patient to Part 2 (see `evaluation/`).
+-  - The gold requires a prior anti-PD-1 or anti-PD-L1 antibody in the NSCLC branch. The protocol also admits patients "considered ineligible to receive therapy with these agents". Per C26 this stays as text (Q11).
++  - The gold requires a prior anti-PD-1 or anti-PD-L1 antibody in the NSCLC branch. The protocol also admits patients "considered ineligible to receive therapy with these agents". Since 10/06 the therapy is encoded and that alternative stays as text, as in the gold (C26, Q11).
+ - **NCT05059262 exclusion of prior CSF1 or CSF1R therapy.** The gold puts the two negated classes in an OR, which admits a patient treated with one of them. Excluding any of several items is an AND of negations.
+ - **Gold typos** are not reproduced (C23): "Anti-EFGR", "Anitneoplastic", "CLTA-4", and "PD-1 Inhibitor" beside "PD1 Inhibitor" in the NCT02972034 gold.
+ 
+@@ -105,4 +109,4 @@ Open:
+ 4. **Q8.** A drug class named by the protocol ("fluoropyrimidines"): `agent_class` with NCIt's class name (current), or `agent` as in the NCT02972034 gold?
+ 5. **Q9.** "Anti-vascular endothelial growth factor": an anti-VEGF class (protocol words), or "Anti-VEGFR Monoclonal Antibody" (gold)?
+ 6. **Q10.** "Able to swallow oral medication" is in the NCT02972034 and NCT05059262 gold texts, while the reviewer (09/25) leaves administration criteria out. Keep it out (current)?
+-7. **Q11.** A required prior therapy with an "or considered ineligible for it" alternative: text only (current, C26), or the therapy leaf as in the NCT02783300 gold?
++7. **Q11.** A required prior therapy with an "or considered ineligible for it" alternative: the therapy leaf plus the alternative as text (current since 10/06, C26, as in the NCT02783300 gold), or text only?
+diff --git a/docs/RUNBOOK.md b/docs/RUNBOOK.md
+index 140393f..4b825d4 100644
+--- a/docs/RUNBOOK.md
++++ b/docs/RUNBOOK.md
+@@ -24,7 +24,7 @@ python -m pytest -q
+ ruff check app evaluation
+ ```
+ 
+-Expected: `153 passed`, and `All checks passed!`.
++Expected: `161 passed`, and `All checks passed!`.
+ 
+ Any Python from 3.10 to 3.14 works. `py -0` lists the versions installed on the computer. If 3.13 is not installed, use another version in the `venv` command, for example `py -3.12`.
+ 

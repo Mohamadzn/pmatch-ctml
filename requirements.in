@@ -1,0 +1,25 @@
+# Runtime. The pins match the repository's main branch requirements.txt.
+# requirements.txt is compiled from this file for Python 3.10 to 3.14 on Windows, macOS and Linux:
+#   uv pip compile requirements.in --universal --python-version 3.10 -o requirements.txt
+agent-framework-core==1.15.0
+agent-framework-openai==1.14.0
+# The async Azure SDK clients (Document Intelligence) need an async HTTP transport.
+aiohttp==3.14.3
+azure-ai-documentintelligence==1.0.2
+azure-core==1.41.0
+azure-identity==1.25.3
+fastapi==0.138.0
+httpx==0.28.1
+jsonschema==4.26.0
+openai==2.54.0
+pydantic==2.13.4
+pypdf==6.16.2
+python-dotenv==1.2.3
+python-multipart==0.0.32
+tzdata==2026.3
+uvicorn==0.52.4
+
+# Development and tests
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.9
